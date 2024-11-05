@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 # https://github.com/RyanLiGod/hnsw-python/blob/master/hnsw.py
 
-
-import pprint
-import sys
-from heapq import heapify, heappop, heappush, heapreplace, nlargest, nsmallest
+from heapq import heapify, heappop, heappush, heapreplace, nlargest
 from math import log2
 from operator import itemgetter
 from random import random
@@ -19,7 +16,7 @@ class HNSW(object):
 
     def cosine_distance(self, a, b):
         try:
-            return 1 - np.dot(a, b)/(np.linalg.norm(a)*(np.linalg.norm(b)))
+            return 1 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
         except ValueError:
             print(a)
             print(b)
@@ -27,8 +24,7 @@ class HNSW(object):
     def vectorized_distance_(self, x, ys):
         return [self.distance_func(x, y) for y in ys]
 
-    def __init__(self, distance_type, m=5, ef=200, m0=None):
-        self.data = []
+    def __init__(self, distance_type, M=5, efConstruction=200, Mmax=None):
         if distance_type == "l2":
             distance_func = self.l2_distance
         elif distance_type == "cosine":
@@ -36,181 +32,138 @@ class HNSW(object):
         else:
             raise TypeError('Please check your distance type!')
         self.distance_func = distance_func
-
-        self.distance = distance_func
         self.vectorized_distance = self.vectorized_distance_
-
-        self._m = m
-        self._ef = ef
-        self._m0 = 2 * m if m0 is None else m0
-        self._level_mult = 1 / log2(m)
+        self._M = M
+        self._efConstruction = efConstruction
+        self._Mmax = 2 * M if Mmax is None else Mmax
+        self._level_mult = 1 / log2(M)
         self._graphs = []
         self._enter_point = None
+        self.data = []
         
-    def add(self, elem, ef=None):
+    ### Algorithm 1: INSERT
+    def insert(self, q, efConstruction=None):
 
-        if ef is None:
-            ef = self._ef
+        if efConstruction is None:
+            efConstruction = self._efConstruction
 
-        distance = self.distance
+        distance = self.distance_func
         data = self.data
         graphs = self._graphs
-        point = self._enter_point
-        m = self._m
+        ep = self._enter_point
+        M = self._M
 
-        # level at which the element will be inserted
-        level = int(-log2(random()) * self._level_mult) + 1
-
-        # elem will be at data[idx]
+        # line 4: determine level for the new element q
+        l = int(-log2(random()) * self._level_mult) + 1
         idx = len(data)
-        data.append(elem)
+        data.append(q)
 
-        if point is not None:  # the HNSW is not empty, we have an entry point
-            dist = distance(elem, data[point])
-            # for all levels in which we dont have to insert elem,
-            # we search for the closest neighbor
-            for layer in reversed(graphs[level:]):
-                point, dist = self._search_graph_ef1(elem, point, dist, layer)
-
-            # at these levels we have to insert elem; ep is a heap of entry points.
-            ep = [(-dist, point)]
+        if ep is not None: 
+            neg_dist = -distance(q, data[ep])
+            # distance(q, data[ep])
             
+            # line 5-7: find the closest neighbor for levels above the insertion level
+            for lc in reversed(graphs[l:]):
+                neg_dist, ep = self._search_layer(q, [(neg_dist, ep)], lc, 1)[0]
+            
+            # line 8-17: insert q at the relevant levels; W is a candidate list
             layer0 = graphs[0]
-            for layer in reversed(graphs[:level]):
-                level_m = m if layer is not layer0 else self._m0
-                # navigate the graph and update ep with the closest nodes we find
-                ep = self._search_graph(elem, ep, layer, ef)
+            for lc in reversed(graphs[:l]):
+                M_layer = M if lc is not layer0 else self._Mmax
                 
-                # insert in g[idx] the best neighbors
-                layer[idx] = layer_idx = {}
-                self._select(layer_idx, ep, level_m, layer, heap=True)
+                # line 9: update W with the closest nodes found in the graph
+                W = self._search_layer(q, [(neg_dist, ep)], lc, efConstruction)
                 
-                # insert backlinks to the new node
+                # line 10: insert the best neighbors for q at this layer
+                lc[idx] = layer_idx = {}
+                self._select(layer_idx, W, M_layer, lc, heap=True)
+                
+                # line 11-13: insert bidirectional links to the new node
                 for j, dist in layer_idx.items():
-                    self._select(layer[j], (idx, dist), level_m, layer)
+                    self._select(lc[j], (idx, dist), M_layer, lc)
                     
-
-        for i in range(len(graphs), level):
-            # for all new levels, we create an empty graph
+        # line 18: create empty graphs for all new levels
+        for _ in range(len(graphs), l):
             graphs.append({idx: {}})
             self._enter_point = idx
 
 
-    def search(self, q, k=None, ef=None):
-        """Find the k points closest to q."""
+    ### Algorithm 5: K-NN-SEARCH
+    def search(self, q, K=5, efSearch=20):
+        """Find the K points closest to q."""
 
-        distance = self.distance
+        distance = self.distance_func
         graphs = self._graphs
-        point = self._enter_point
+        ep = self._enter_point
 
-        if ef is None:
-            ef = self._ef
-
-        if point is None:
+        if ep is None:
             raise ValueError("Empty graph")
 
-        dist = distance(q, self.data[point])
-        # look for the closest neighbor from the top to the 2nd level
-        for layer in reversed(graphs[1:]):
-            point, dist = self._search_graph_ef1(q, point, dist, layer)
-        # look for ef neighbors in the bottom level
-        ep = self._search_graph(q, [(-dist, point)], graphs[0], ef)
+        neg_dist = -distance(q, self.data[ep])
 
-        if k is not None:
-            ep = nlargest(k, ep)
+        # line 1-5: search from top layers down to the second level
+        for lc in reversed(graphs[1:]):
+            neg_dist, ep = self._search_layer(q, [(neg_dist, ep)], lc, 1)[0]
+
+        # line 6: search with efSearch neighbors at the bottom level
+        W = self._search_layer(q, [(neg_dist, ep)], graphs[0], efSearch)
+
+        if K is not None:
+            W = nlargest(K, W)
         else:
-            ep.sort(reverse=True)
+            W.sort(reverse=True)
 
-        return [(idx, -md) for md, idx in ep]
+        return [(idx, -md) for md, idx in W]
 
 
-    def _search_graph_ef1(self, q, entry, dist, layer):
-        """Equivalent to _search_graph when ef=1."""
-
-        vectorized_distance = self.vectorized_distance
-        data = self.data
-
-        best = entry
-        best_dist = dist
-        candidates = [(dist, entry)]
-        visited = set([entry])
-
-        while candidates:
-            dist, c = heappop(candidates)
-            if dist > best_dist:
-                break
-            edges = [e for e in layer[c] if e not in visited]
-            visited.update(edges)
-            dists = vectorized_distance(q, [data[e] for e in edges])
-            for e, dist in zip(edges, dists):
-                if dist < best_dist:
-                    best = e
-                    best_dist = dist
-                    heappush(candidates, (dist, e))
-                    # break
-
-        return best, best_dist
-
-    def _search_graph(self, q, ep, layer, ef):
+    ### Algorithm 2: SEARCH-LAYER
+    def _search_layer(self, q, W, lc, ef):
 
         vectorized_distance = self.vectorized_distance
         data = self.data
 
-        candidates = [(-mdist, p) for mdist, p in ep]
-        heapify(candidates)
-        visited = set(p for _, p in ep)
+        # Step 1: Initialize candidate list and visited set
+        C = [(-neg_dist, idx) for neg_dist, idx in W] 
+        heapify(C)
+        heapify(W)
+        visited = set(idx for _, idx in W)  
 
-        while candidates:
-            dist, c = heappop(candidates)
-            mref = ep[0][0]
-            if dist > -mref:
+        # Step 4-17: Explore neighbors until candidate list is exhausted
+        while C:
+            dist, c = heappop(C)
+            furthest = -W[0][0]
+            if dist > furthest:
                 break
-            edges = [e for e in layer[c] if e not in visited]
-            visited.update(edges)
-            dists = vectorized_distance(q, [data[e] for e in edges])
-            for e, dist in zip(edges, dists):
-                mdist = -dist
-                if len(ep) < ef:
-                    heappush(candidates, (dist, e))
-                    heappush(ep, (mdist, e))
-                    mref = ep[0][0]
-                elif mdist > mref:
-                    heappush(candidates, (dist, e))
-                    heapreplace(ep, (mdist, e))
-                    mref = ep[0][0]
+            neighbors = [e for e in lc[c] if e not in visited]
+            visited.update(neighbors)
+            dists = vectorized_distance(q, [data[e] for e in neighbors])
+            for e, dist in zip(neighbors, dists):
+                neg_dist = -dist
+                if len(W) < ef:
+                    heappush(C, (dist, e))
+                    heappush(W, (neg_dist, e))
+                    furthest = -W[0][0]
+                elif dist < furthest:
+                    heappush(C, (dist, e))
+                    heapreplace(W, (neg_dist, e))
+                    furthest = -W[0][0]
 
-        return ep
+        return W
 
-    def _select(self, d, to_insert, m, layer, heap=False):
-
+    ### Algorithm 3: SELECT-NEIGHBORS-SIMPLE
+    def _select(self, R, C, M, lc, heap=False):
+        
         if not heap:
-            idx, dist = to_insert
-            assert idx not in d
-            if len(d) < m:
-                d[idx] = dist
+            idx, dist = C
+            if len(R) < M:
+                R[idx] = dist
             else:
-                max_idx, max_dist = max(d.items(), key=itemgetter(1))
+                max_idx, max_dist = max(R.items(), key=itemgetter(1))
                 if dist < max_dist:
-                    del d[max_idx]
-                    d[idx] = dist
+                    del R[max_idx]
+                    R[idx] = dist
             return
-
-        assert not any(idx in d for _, idx in to_insert)
-        to_insert = nlargest(m, to_insert)  # smallest m distances
-        unchecked = m - len(d)
-        assert 0 <= unchecked <= m
-        to_insert, checked_ins = to_insert[:unchecked], to_insert[unchecked:]
-        to_check = len(checked_ins)
-        if to_check > 0:
-            checked_del = nlargest(to_check, d.items(), key=itemgetter(1))
+        
         else:
-            checked_del = []
-        for md, idx in to_insert:
-            d[idx] = -md
-        zipped = zip(checked_ins, checked_del)
-        for (md_new, idx_new), (idx_old, d_old) in zipped:
-            if d_old <= -md_new:
-                break
-            del d[idx_old]
-            d[idx_new] = -md_new
-            assert len(d) == m
+            C = nlargest(M, C)
+            R.update({idx: -neg_dist for neg_dist, idx in C})

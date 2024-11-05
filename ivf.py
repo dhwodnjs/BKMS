@@ -6,7 +6,6 @@ from sklearn.preprocessing import normalize
 
 class IVF:
 
-
     def _compute_distance(self, data, q):
         """Compute the appropriate distance based on the distance type."""
         if self.distance_type == 'l2':
@@ -45,18 +44,20 @@ class IVF:
 
         if self.distance_type == "cosine":
             q = q / np.linalg.norm(q)
-
         
-        cluster_distances = self._compute_distance(self.kmeans.cluster_centers_, q.reshape(1, -1)).flatten()    
+        cluster_distances = self._compute_distance(self.kmeans.cluster_centers_, q).flatten()    
         probe_clusters = np.argpartition(cluster_distances, n_probes)[:n_probes]
 
-        candidates = np.concatenate([self.data[self.inverted_index[cl]] for cl in probe_clusters])
+        candidates = np.concatenate([self.inverted_index[cl] for cl in probe_clusters])
 
         if len(candidates) <= k:
-            return np.arange(len(candidates))
+            return candidates
         
-        dists = self._compute_distance(candidates, q.reshape(1, -1)).flatten()
-        top_k = np.argpartition(dists, k)[:k]
+        dists = self._compute_distance(self.data[candidates], q).flatten()
+        top_idx = np.argpartition(dists, k)[:k]
 
-        return [(idx, dists[idx]) for idx in top_k]
+        top_k = candidates[top_idx]
+        top_dist = dists[top_idx]
+
+        return [(k, dist) for k, dist in zip(top_k, top_dist)]
 
